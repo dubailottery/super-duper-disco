@@ -7,7 +7,7 @@
 # Pipeline:
 #   1. 20 parallel jobs clone the PRIVATE repo and render a video chunk
 #   2. One final job stitches all chunks together with ffmpeg
-#   3. The final MP4 is uploaded to Supabase Storage under renders/<jobId>/
+#   3. The final MP4 is published as a public GitHub release asset
 #   4. The render_jobs row in Supabase DB is marked 'completed'
 # =============================================================================
 
@@ -24,6 +24,9 @@ on:
         description: "JSON-serialised VideoProps to pass to Remotion"
         required: true
         type: string
+
+permissions:
+  contents: write
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PHASE 1 — THE SWARM
@@ -140,10 +143,10 @@ jobs:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PHASE 2 — STITCH & DELIVER
-# Runs after all 20 chunk jobs succeed. Downloads, concatenates, uploads.
+# Runs after all 20 chunk jobs succeed. Downloads, concatenates, and publishes.
 # ─────────────────────────────────────────────────────────────────────────────
   combine-and-deliver:
-    name: Stitch chunks & upload to Supabase
+    name: Stitch chunks & publish download
     runs-on: ubuntu-latest
     needs: render-chunk   # waits for ALL 20 matrix jobs to finish
 
@@ -187,26 +190,54 @@ jobs:
             final-video.mp4
           echo "Final video size: $(du -sh final-video.mp4)"
 
-      # ── 5. Upload to Supabase Storage ─────────────────────────────────────────
-      # We use a small inline Node.js script so we don't need to clone the
-      # private repo again — just the @supabase/storage-js package is enough.
-      - name: Setup Node.js for upload
+      # ── 5. Publish the final MP4 as a public GitHub release asset ────────────
+      # This gives the browser a direct GitHub-hosted download URL, so Vercel
+      # never proxies the 300 MB file and we avoid Supabase storage limits.
+      - name: Publish direct download asset
+        id: release_asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_ID: ${{ inputs.job_id }}
+          RELEASE_TAG: renders
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          ASSET_NAME="render-${JOB_ID}.mp4"
+          ASSET_PATH="./${ASSET_NAME}"
+          DOWNLOAD_URL="https://github.com/${REPOSITORY}/releases/download/${RELEASE_TAG}/${ASSET_NAME}"
+
+          gh release view "${RELEASE_TAG}" --repo "${REPOSITORY}" >/dev/null 2>&1 || \
+            gh release create "${RELEASE_TAG}" \
+              --repo "${REPOSITORY}" \
+              --title "Rendered videos" \
+              --notes "Automated video render outputs for direct browser downloads."
+
+          cp "./final-video.mp4" "${ASSET_PATH}"
+
+          gh release upload "${RELEASE_TAG}" "${ASSET_PATH}" \
+            --repo "${REPOSITORY}" \
+            --clobber
+
+          echo "asset_name=${ASSET_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "download_url=${DOWNLOAD_URL}" >> "${GITHUB_OUTPUT}"
+
+      # ── 6. Mark the job completed in Supabase DB ─────────────────────────────
+      - name: Setup Node.js for DB update
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Install Supabase storage client
+      - name: Install Supabase client
         run: npm install @supabase/supabase-js
 
-      - name: Upload to Supabase + mark job completed
+      - name: Mark job completed
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           JOB_ID: ${{ inputs.job_id }}
+          DIRECT_DOWNLOAD_URL: ${{ steps.release_asset.outputs.download_url }}
         run: |
           node - <<'EOF'
           const { createClient } = require('@supabase/supabase-js');
-          const fs = require('fs');
 
           const supabase = createClient(
             process.env.SUPABASE_URL,
@@ -214,35 +245,11 @@ jobs:
             { auth: { persistSession: false } }
           );
           const jobId = process.env.JOB_ID;
-          const storagePath = `${jobId}/video.mp4`;
+          const directDownloadUrl = process.env.DIRECT_DOWNLOAD_URL;
 
           async function main() {
-            console.log(`Uploading final-video.mp4 → renders/${storagePath}`);
-
-            const fileBuffer = fs.readFileSync('./final-video.mp4');
-
-            // Upload the stitched video to the 'renders' bucket
-            const { error: uploadError } = await supabase.storage
-              .from('renders')
-              .upload(storagePath, fileBuffer, {
-                contentType: 'video/mp4',
-                upsert: true,
-                // 1 hour signed URL is generated on-demand by the API; no public URL needed
-              });
-
-            if (uploadError) {
-              throw new Error(`Storage upload failed: ${uploadError.message}`);
-            }
-            console.log('Video uploaded to Supabase storage ✓');
-
-            // Generate a 1-hour signed URL for immediate playback
-            const { data: signedData, error: signedError } = await supabase.storage
-              .from('renders')
-              .createSignedUrl(storagePath, 3600);
-
-            const signedUrl = signedData?.signedUrl ?? null;
-            if (signedError) {
-              console.warn('Could not generate signed URL:', signedError.message);
+            if (!directDownloadUrl) {
+              throw new Error('Missing direct download URL from GitHub release upload');
             }
 
             // Mark the render job as completed in Supabase DB
@@ -251,8 +258,8 @@ jobs:
               .update({
                 status: 'completed',
                 progress: 100,
-                message: 'Render complete — video ready for download',
-                url: signedUrl,
+                message: 'Render complete — direct download ready',
+                url: directDownloadUrl,
               })
               .eq('id', jobId);
 
@@ -260,6 +267,7 @@ jobs:
               throw new Error(`DB update failed: ${dbError.message}`);
             }
             console.log(`render_jobs row ${jobId} marked completed ✓`);
+            console.log(`Direct download URL: ${directDownloadUrl}`);
           }
 
           main().catch((err) => {
@@ -273,12 +281,12 @@ jobs:
             supabase2.from('render_jobs').update({
               status: 'failed',
               error: err.message,
-              message: 'Stitch/upload step failed',
+              message: 'Stitch/publish step failed',
             }).eq('id', process.env.JOB_ID).then(() => process.exit(1));
           });
           EOF
 
-      # ── 6. Upload final video as GH artifact too (optional backup) ────────────
+      # ── 7. Upload final video as GH artifact too (optional backup) ────────────
       - name: Upload final video as GitHub artifact
         uses: actions/upload-artifact@v4
         with:
