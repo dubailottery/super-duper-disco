@@ -159,7 +159,7 @@ jobs:
 
       # ── 2. Install ffmpeg ─────────────────────────────────────────────────────
       - name: Install ffmpeg
-        run: sudo apt-get install -y ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
       # ── 3. Generate concat list ───────────────────────────────────────────────
       # ffmpeg's concat demuxer needs a text file listing files in order.
