@@ -28,39 +28,33 @@ on:
 permissions:
   contents: write
 
+env:
+  REMOTION_CONCURRENCY: '4'
+  REMOTION_CHUNKS: '20'
+  PREPARED_WORKSPACE_ARTIFACT: prepared-renderer-workspace
+
 # ─────────────────────────────────────────────────────────────────────────────
-# PHASE 1 — THE SWARM
-# 20 concurrent runners each render 1/20th of the video
+# PHASE 0 — PREPARE RENDERER
+# Clone once, install once, ensure browser once, bundle once.
+# All render jobs reuse this prepared workspace artifact.
 # ─────────────────────────────────────────────────────────────────────────────
 jobs:
-  render-chunk:
-    name: Render chunk ${{ matrix.chunk_index }}
+  prepare-renderer:
+    name: Prepare renderer workspace
     runs-on: ubuntu-latest
-
-    strategy:
-      fail-fast: false   # if one chunk errors, let others finish so we can debug
-      matrix:
-        chunk_index: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+    outputs:
+      total_frames: ${{ steps.frames.outputs.total_frames }}
 
     steps:
       # ── 1. Clone Private Vault ──────────────────────────────────────────────
-      # We do NOT checkout the current (empty) public repo.
-      # Instead we pull the real codebase from the private vault using a PAT.
       - name: Clone private vault
         run: |
-          # PRIVATE_REPO_PAT is a Fine-Grained PAT stored as a Secret in THIS
-          # (public burner) repo. It only needs Contents: read on 0Cymantek0/video-render.
-          # GitHub accepts PATs embedded in the clone URL — this is the standard
-          # way to authenticate against private repos from public Actions runners.
-          #
-          # TODO: Remove --branch flag once feature/burner-repo-render is merged to main
           git clone \
             --branch feature/burner-repo-render \
             https://x-access-token:${{ secrets.PRIVATE_REPO_PAT }}@github.com/0Cymantek0/video-render.git \
             ./repo
 
-
-      # ── 2. Setup Node & Install deps ─────────────────────────────────────────
+      # ── 2. Setup Node & Install deps ────────────────────────────────────────
       - name: Setup Node.js 20
         uses: actions/setup-node@v4
         with:
@@ -70,19 +64,15 @@ jobs:
 
       - name: Install dependencies
         working-directory: ./repo
-        run: npm ci
+        run: npm ci --prefer-offline --no-audit
 
-      # ── 3. Write props to disk ────────────────────────────────────────────────
-      # GitHub Actions inputs are strings, so we write the JSON to a file
-      # that the Remotion CLI can read with --props=./props.json
+      # ── 3. Write props once for all chunk jobs ──────────────────────────────
       - name: Write props.json
         run: |
           echo '${{ inputs.props }}' > ./repo/props.json
 
-      # ── 4. Calculate frame range ──────────────────────────────────────────────
-      # We dynamically calculate total frames based on the incoming props using
-      # the exact same function the Remotion composition uses.
-      - name: Calculate frame range
+      # ── 4. Calculate total frames once ──────────────────────────────────────
+      - name: Calculate total frames
         id: frames
         working-directory: ./repo
         run: |
@@ -92,9 +82,64 @@ jobs:
           const props = JSON.parse(fs.readFileSync('./props.json', 'utf-8'));
           console.log(getVideoDurationInFrames(props));
           EOF
-          
+
           TOTAL_FRAMES=$(npx tsx calc-frames.ts)
-          CHUNKS=20
+          echo "total_frames=${TOTAL_FRAMES}" >> $GITHUB_OUTPUT
+          echo "Total Frames: $TOTAL_FRAMES"
+
+      # ── 5. Install Chromium once for all chunk jobs ─────────────────────────
+      - name: Install Chromium
+        working-directory: ./repo
+        run: npx remotion browser ensure
+
+      # ── 6. Warm the production bundle cache once ────────────────────────────
+      - name: Warm Remotion bundle cache
+        working-directory: ./repo
+        run: npx remotion compositions src/remotion/index.ts --log=verbose >/dev/null
+
+      # ── 7. Pack prepared workspace for fast fan-out ─────────────────────────
+      - name: Pack prepared workspace
+        run: tar --exclude='./repo/.git' -czf renderer-workspace.tgz ./repo
+
+      - name: Upload prepared workspace artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PREPARED_WORKSPACE_ARTIFACT }}
+          path: renderer-workspace.tgz
+          retention-days: 1
+          compression-level: 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE 1 — THE SWARM
+# 20 concurrent runners each render 1/20th of the video
+# ─────────────────────────────────────────────────────────────────────────────
+  render-chunk:
+    name: Render chunk ${{ matrix.chunk_index }}
+    runs-on: ubuntu-latest
+    needs: prepare-renderer
+
+    strategy:
+      fail-fast: false   # if one chunk errors, let others finish so we can debug
+      matrix:
+        chunk_index: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+
+    steps:
+      # ── 1. Download prepared renderer workspace ─────────────────────────────
+      - name: Download prepared workspace
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.PREPARED_WORKSPACE_ARTIFACT }}
+
+      - name: Extract prepared workspace
+        run: tar -xzf renderer-workspace.tgz
+
+      # ── 2. Calculate frame range ────────────────────────────────────────────
+      - name: Calculate frame range
+        id: frames
+        run: |
+          TOTAL_FRAMES=${{ needs.prepare-renderer.outputs.total_frames }}
+          CHUNKS=${{ env.REMOTION_CHUNKS }}
           CHUNK_SIZE=$(( TOTAL_FRAMES / CHUNKS ))
           CHUNK_INDEX=${{ matrix.chunk_index }}
           START_FRAME=$(( CHUNK_INDEX * CHUNK_SIZE ))
@@ -110,12 +155,7 @@ jobs:
           echo "end=${END_FRAME}" >> $GITHUB_OUTPUT
           echo "Total Frames: $TOTAL_FRAMES | Chunk $CHUNK_INDEX → frames ${START_FRAME}-${END_FRAME}"
 
-      # ── 5. Install Chromium for Remotion ─────────────────────────────────────
-      - name: Install Chromium
-        working-directory: ./repo
-        run: npx remotion browser ensure
-
-      # ── 6. Render the chunk ───────────────────────────────────────────────────
+      # ── 3. Render the chunk ─────────────────────────────────────────────────
       # --frames=START-END renders only the slice this runner owns
       # --props=./props.json passes the dynamic lottery data
       - name: Render chunk ${{ matrix.chunk_index }}
@@ -127,10 +167,11 @@ jobs:
             out.mp4 \
             --props=./props.json \
             --frames=${{ steps.frames.outputs.start }}-${{ steps.frames.outputs.end }} \
+            --concurrency=${{ env.REMOTION_CONCURRENCY }} \
             --codec=h264 \
             --log=verbose
 
-      # ── 7. Upload chunk as artifact ───────────────────────────────────────────
+      # ── 4. Upload chunk as artifact ─────────────────────────────────────────
       # Each chunk artifact is named chunk-N so they don't overwrite each other.
       # The final job downloads all of them in order.
       - name: Upload chunk artifact
