@@ -78,6 +78,14 @@ jobs:
             --props ./props.json \
             --output-dir render-assets/workflow/${{ inputs.job_id }}
 
+      - name: Verify staged assets in prepare job
+        working-directory: ./repo
+        run: |
+          echo "--- staged props excerpt ---"
+          cat ./props.json
+          echo "--- staged asset files ---"
+          find ./public/render-assets/workflow/${{ inputs.job_id }} -maxdepth 2 -type f | sort
+
       - name: Build chunk matrix
         id: chunk-matrix
         run: |
@@ -146,6 +154,13 @@ jobs:
 
       - name: Extract prepared workspace
         run: tar -xzf renderer-workspace.tgz
+
+      - name: Verify staged assets in chunk workspace
+        run: |
+          echo "--- extracted staged asset files ---"
+          find ./repo/public/render-assets/workflow/${{ inputs.job_id }} -maxdepth 2 -type f | sort
+          echo "--- extracted props excerpt ---"
+          cat ./repo/props.json
 
       # ── 2. Calculate frame range ────────────────────────────────────────────
       - name: Calculate frame range
